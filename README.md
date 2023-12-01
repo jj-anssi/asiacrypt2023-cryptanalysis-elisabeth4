@@ -24,6 +24,7 @@ To compile the code from this repository, you will need the following dependenci
 * `libm4ri`
 * `libgsl` 
 * `Cado-NFS`
+* `OpenMP`
 
 We provide detailed informations to install them of your system, assuming your distribution supports `apt`.
 
@@ -31,6 +32,12 @@ We provide detailed informations to install them of your system, assuming your d
 
 ```sh
 $ apt install libm4ri-dev
+```
+
+#### `OpenMP`
+
+```sh
+$ apt install libomp-dev
 ```
 
 #### `libgsl` (version 2.7)
@@ -72,38 +79,38 @@ After installing the dependencies, compile the code in this repository by runnin
 make
 ```
 
-### Running the attack on Elisabeth-4
+### Running the attack on Elisabeth-4 with no filtering
 
 After a successful compilation, run the attack as follows.
 We also provide the `make test` command in the `Makefile` that runs the commands explicited below.
 
-Select the active variant in the source code (`main.c`, variable `activeVariant`line 66):
+Select the active variant in the source code (`main.c`, variable `activeVariant` line 68):
 ```c
-variant *activeVariant = &lily3_10_2;
+variant *activeVariant = &lily3_12_2;
 ```
 
 Generate the polynomial Basis associated to the variant
 ```sh
-$ mkdir lily3_10_2
-$ ./elisabeth buildPolynomialBasisMatrix lily3_10_2
+$ mkdir lily3_12_2
+$ ./elisabeth buildPolynomialBasisMatrix lily3_12_2
 ```
 
 Generate the basis matrices
 ```sh
-$ ./elisabeth buildBasisMatrices lily3_10_2
+$ ./elisabeth buildBasisMatrices lily3_12_2
 ```
 
 The previous two steps are done once for all for a given variant.
 
 Generate an instance of the system to solve
 ```sh
-$ mkdir lily3_10_2/instance1
-$ ./elisabeth buildInstance lily3_10_2 lily3_10_2/instance1
+$ mkdir lily3_12_2/instance1
+$ ./elisabeth buildInstance lily3_12_2 lily3_12_2/instance1
 ```
 
 Resolution of the system, using `Cado-NFS`
 ```sh
-$ cd lily3_10_2/instance1
+$ cd lily3_12_2/instance1
 ```
 
 Generate weight files
@@ -135,9 +142,9 @@ $ bwc.pl :complete                          \
   wdir=/tmp/wdir                            \
   mn=64                                     \
   nullspace=left                            \
-  matrix=/app/lily3_10_2/instance1/tA.bin   \
+  matrix=/app/lily3_12_2/instance1/tA.bin   \
   thr=2x2                                   \
-  balancing=/app/lily3_10_2/instance1/tA.2x2.*.bin
+  balancing=/app/lily3_12_2/instance1/tA.2x2.*.bin
 ```
 
 Get the solution from the working directory
@@ -148,14 +155,14 @@ $ cd ../..
 
 ```sh
 Print solution
-$ ./elisabeth printSolution lily3_10_2/instance1
+$ ./elisabeth printSolution lily3_12_2/instance1
 ```
 
-### Extracting the key
+### Running the attack on Elisabeth-4 with filtering
 
-**WIP**
+We also provide the command `make test-filtering` that runs an optimized attack as described in the paper that relies on the filtering technique.
 
-<!-- Pour l'instant, je me suis arrete la, j'extrais a la main le resultat de ce qui s'affiche. Mais je compte finir le solver pour remonter a la cle -->
+You can have a look at the file `run-test-with-filtering.sh` to get more details about the various steps.
 
 ### Authors
 

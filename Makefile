@@ -1,5 +1,5 @@
 all:
-	gcc -Wall -O3 -o elisabeth main.c -lm4ri -lcrypto -lgsl -lgslcblas
+	gcc -Wall -O3 -o elisabeth main.c -lm4ri -lcrypto -lgsl -lgslcblas -fopenmp
 
 docker-build:
 	sudo docker build -t ac2023-elisabeth4 .
@@ -10,5 +10,8 @@ docker-run:
 test:
 	/bin/bash ./run-test.sh
 
+test-filtering:
+	/bin/bash ./run-test-with-filtering.sh
+
 clean:
-	rm -rf lily3_10_2 /tmp/wdir *.o elisabeth
+	rm -rf lily3_12_2 /tmp/wdir *.o elisabeth

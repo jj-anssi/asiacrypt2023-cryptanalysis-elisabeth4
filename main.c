@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <omp.h>
 #include <sys/random.h>
 #include <m4ri/m4ri.h>
 #include <openssl/evp.h>
@@ -59,11 +60,12 @@ variant Elisabeth4 = {16, 4, 256, 12, S1, S2, S3, S4, S5, S6, S7, S8};
 variant lily4 = {16, 4, 5, 1, S1, S2, S3, S4, S5, S6, S7, S8};
 variant lily3 = {8, 3, 5, 1, toyS1, toyS2, toyS3, toyS4, toyS5, toyS6, toyS7, toyS8};
 variant lily3_10_2 = {8, 3, 10, 2, toyS1, toyS2, toyS3, toyS4, toyS5, toyS6, toyS7, toyS8};
+variant lily3_12_2 = {8, 3, 12, 2, toyS1, toyS2, toyS3, toyS4, toyS5, toyS6, toyS7, toyS8};
 variant lily3_30_2 = {8, 3, 30, 2, toyS1, toyS2, toyS3, toyS4, toyS5, toyS6, toyS7, toyS8};
 variant lily2 = {4, 2, 5, 1, ltoyS1, ltoyS2, ltoyS3, ltoyS4, ltoyS5, ltoyS6, ltoyS7, ltoyS8};
 
 // Choose the variant to attack (active variant)
-variant *activeVariant = &lily3_10_2;
+variant *activeVariant = &lily3_12_2;
 
 // XOF constants
 unsigned char *C0 = (unsigned char *) "0123456789abcdef";
@@ -129,9 +131,6 @@ nibble_t permutations[24] = {
 /*
  * An implementention of Elisabeth ciphers
  */
-unsigned char XOF_K[16];
-unsigned char XOF_R[16];
-int XOF_offset;
 
 // AES encryption
 void encrypt_aes(unsigned char *plaintext, unsigned char * key,
@@ -155,50 +154,55 @@ void encrypt_aes(unsigned char *plaintext, unsigned char * key,
     EVP_CIPHER_CTX_free(ctx);
 }
 
-// XOF functions
+typedef struct _XOF_state {
+    unsigned char XOF_K[16];
+    unsigned char XOF_R[16];
+    int XOF_offset;
+} XOF_state;
+
 //   init: init XOF_K with IV
-void XOF_init(unsigned char *iv) {
+void XOF_init(XOF_state *x, unsigned char *iv) {
     int i;
-    for (i = 0; i < 16; i++) XOF_K[i] = iv[i];
-    XOF_offset = 128;
+    for (i = 0; i < 16; i++) x->XOF_K[i] = iv[i];
+    x->XOF_offset = 128;
 }
 
 //   update: refresh XOF_K and XOF_R, and update number of fresh bits in R
-void XOF_update() {
+void XOF_update(XOF_state *x) {
     int i;
     unsigned char tmp[16];
-    encrypt_aes(C0, XOF_K, tmp);
-    encrypt_aes(C1, XOF_K, XOF_R);
-    for (i = 0; i < 16; i++) XOF_K[i] = tmp[i];
-    XOF_offset = 0;
+    encrypt_aes(C0, x->XOF_K, tmp);
+    encrypt_aes(C1, x->XOF_K, x->XOF_R);
+    for (i = 0; i < 16; i++) x->XOF_K[i] = tmp[i];
+    x->XOF_offset = 0;
 }
 
 //  bits: extract an nbit integer from the bitstream produced by the XOF, updating the state when needed
-unsigned int XOF_bits(int n) {
+unsigned int XOF_bits(XOF_state *x, int n) {
     int u, r, s, p=0;
     unsigned int res = 0;
     while (n > 0) {
-        if (XOF_offset == 128) XOF_update();
+        if (x->XOF_offset == 128) XOF_update(x);
         // number of bits used in the current byte
-        u = XOF_offset % 8;
+        u = x->XOF_offset % 8;
         // number of bits remaining in the current byte
         r = 8 - u;
         // number of bits to transfer
         s = r < n ? r : n;
         // transfer bits to result
-        res ^= ((XOF_R[XOF_offset >> 3] >> u) % (1 << s)) << p;
+        res ^= ((x->XOF_R[x->XOF_offset >> 3] >> u) % (1 << s)) << p;
         p += s;
         n -= s;
-        XOF_offset += s;
+        x->XOF_offset += s;
     }
     return res;
 }
 
 //  int: produce an integer in an interval [a,b[, uses rejection sampling
-unsigned int XOF_int(unsigned int a, unsigned int b) {
+unsigned int XOF_int(XOF_state *x, unsigned int a, unsigned int b) {
     unsigned int r, n = __builtin_clz(1) + 1 - __builtin_clz(b-a-1);
     //printf("%u %d\n", b-a, n);
-    while ((r = XOF_bits(n)) >= b-a);
+    while ((r = XOF_bits(x, n)) >= b-a);
     return a + r;
 }
 
@@ -224,34 +228,56 @@ uint8_t h(const uint8_t x1, const uint8_t x2, const uint8_t x3, const uint8_t x4
 
 // Elisabeth state
 #define MAX_ELI_N   256
-unsigned char ELI_S[MAX_ELI_N];
+typedef struct _ELI_state {
+    variant *algo;
+    XOF_state x;
+    unsigned char k[MAX_ELI_N];
+    int perm[MAX_ELI_N];
+    unsigned char w[MAX_ELI_N];
+    unsigned char z;
+} ELI_state;
 
 // Elisabeth init function, init XOF and key register
-void ELISABETH_init(variant *algo, unsigned char *key, unsigned char *iv) {
+void ELISABETH_init(ELI_state *es, variant *algo, unsigned char *key, unsigned char *iv) {
     int i;
+    es->algo = algo;
+    XOF_init(&(es->x), iv);
     for (i = 0; i < algo->N; i++) {
-        ELI_S[i] = key[i];
+        es->k[i] = key[i];
+        es->perm[i] = i;
+        es->w[i] = 0;
     }
-    XOF_init(iv);
 }
 
 // Elisabeth next function, update key register, and compute output nibble
-unsigned char ELISABETH_next(variant *algo) {
-    int j;
-    unsigned char tmp, res = 0;
-    unsigned int r, w;
-    // update state
+unsigned char ELISABETH_next(ELI_state *es) {
+    int j, tmp;
+    unsigned int r, ww;
+    variant *algo = es->algo;
+    unsigned char *k = es->k;
+    int *perm = es->perm;
+    unsigned char *w = es->w;
+    // update permutation and masks
     for (j = 0; j < 5*algo->T; j++) {
-        r = XOF_int(j, algo->N);
-        w = XOF_bits(algo->s);
-        tmp = ELI_S[j]; ELI_S[j] = ELI_S[r]; ELI_S[r] = tmp;
-        ELI_S[j] = (ELI_S[j] + w) % algo->n;
+        r = XOF_int(&(es->x), j, algo->N);
+        ww = XOF_bits(&(es->x), algo->s);
+        // swap positions j and r
+        tmp = perm[j];
+        perm[j] = perm[r];
+        perm[r] = tmp;
+        // update mask of position j
+        w[perm[j]] = (w[perm[j]] + ww) % algo->n;
     }
     // compute output
+    es->z = 0;
     for (j = 0; j < algo->T; j++)
-        res = (res + h(ELI_S[5*j], ELI_S[5*j+1], ELI_S[5*j+2], ELI_S[5*j+3], algo) +
-                ELI_S[5*j+4]) % 16;
-    return res;
+        es->z = (es->z + h(
+                (k[perm[5*j]]   + w[perm[5*j]])   % algo->n,
+                (k[perm[5*j+1]] + w[perm[5*j+1]]) % algo->n,
+                (k[perm[5*j+2]] + w[perm[5*j+2]]) % algo->n,
+                (k[perm[5*j+3]] + w[perm[5*j+3]]) % algo->n, algo) +
+                k[perm[5*j+4]] + w[perm[5*j+4]]) % algo->n;
+    return es->z;
 }
 
 /*
@@ -372,7 +398,7 @@ mzd_t *constructMatrix(variant *algo, uint16_t *perm) {
         }/*m2*/
     }/*m1*/
     printf("\n");
-    
+
     // Apply Mobius transform to get one ANF per row
     applyMobius(TT);
     return TT;
@@ -835,10 +861,9 @@ void buildPolynomialBasisMatrix(variant *algo, char *variant_dir) {
     char fn[1024];
     printf("preparing building of polynomial basis matrix\n");
     monomial_order_init(algo->s*4);
-    sprintf(fn, "%s/basis.png", variant_dir); 
+    sprintf(fn, "%s/basis.png", variant_dir);
     /*       Generation of the basis matrix     */
     // allocations
-    
     // for all permutations
     // - construct the matrix
     // - reorder its columns according to the monomial order
@@ -858,13 +883,11 @@ void buildPolynomialBasisMatrix(variant *algo, char *variant_dir) {
         fprintf(stderr, "echelonization step ");
         rank = mzd_echelonize(mat_tmp, 1);
         fprintf(stderr, "current rank %d\n", rank);
-        
         A = mzd_submatrix(NULL, mat_tmp, 0, 0, rank, mat_tmp->ncols);
         mzd_free(mat_tmp);
     }
     // Save the basis
     mzd_to_png(A, fn, 0, NULL, 0);
-    
     // clean
     mzd_free(A);
     monomial_order_free();
@@ -1101,23 +1124,47 @@ void int_pair_extract_val_nibble(nibble_t *d, int_pair *s)
     }
 }
 
+void genRandomByteString(unsigned char *t, int n)
+{
+    int i, j;
+    for (i = 0; i < n; ) {
+        j = getrandom(t + i, n - i, 0);
+        if (j != -1)
+             i += j;
+    }
+}
+
+void genRandomJobName(unsigned char *t, int n)
+{
+    int i, j;
+    char CHARS[] = "0123456789abcdefghijklmnopqrstuv";
+    for (i = 0; i < n; ) {
+        j = getrandom(t + i, n - i, 0);
+        if (j != -1)
+             i += j;
+    }
+    for (i = 0; i < n; i++) {
+        t[i] = CHARS[t[i]%32];
+    }
+}
+
 #define EXCESS 0 // excess to tweak?
 // Build an instance of the key recovery problem by linearisation for a variant of the Elisabeth
 // family
-// an instance directory is filled with 
+// an instance directory is filled with
 // - a random key
 // - a sparse matric A.bin and its transpose tA.bin, in a format that can be handled by cado-nfs/bwc
 // - a file tracking the dimension of the problem/size of matrix A
+// One long keystream is generated from the all zero IV, every nibble LSB provides one equation to
+// build the system
 void buildInstance(variant *algo, char *variant_dir, char *instance_dir) {
-    int i, j, k, l, tmp;
+    int i, j, k, l;
     mzd_t *polynomial_basis;
     mzd_t *perm_basis[24];
     char buffer[1024];
     unsigned char key[256];
-    int perm[256];
     nibble_t nibble, order;
     int_pair pip[4];
-    unsigned char w[256];
     FILE *fp = NULL;
     rci_t dim;
     uint8_t cst;
@@ -1126,9 +1173,9 @@ void buildInstance(variant *algo, char *variant_dir, char *instance_dir) {
     int nr; // number of equations to collect
     int idx_nibble, idx_order, idx_w;
     int offset;
-    unsigned int r;
     gsl_spmatrix_uchar *tA=NULL, *ctA=NULL;
     int abort = 0;
+    ELI_state es;
     //init nibbles
     nibble_order_init(algo->N);
     //for (i = 0; i < algo->N; i++) {
@@ -1157,7 +1204,7 @@ void buildInstance(variant *algo, char *variant_dir, char *instance_dir) {
         perm_basis[i] = mzd_from_png(buffer, 0);
     }
     //generate key and save key
-    for (i = 0; i < algo->N; j = getrandom(key + i, algo->N - i, 0), j != -1 ? i += j : 0);
+    genRandomByteString(key, algo->N);
     for (i = 0; i < algo->N; i++) key[i] = key[i] % algo->n;
     printf("KEY ");
     for (i = 0; i < algo->N; i++) printf("%X", key[i]);
@@ -1171,54 +1218,33 @@ void buildInstance(variant *algo, char *variant_dir, char *instance_dir) {
     }
     fclose(fp); fp = NULL;
     // Alloc spmatrix
-    tA = gsl_spmatrix_uchar_alloc(nc, nr);
+    printf("%d %d\n", nc, nr);
+    tA = gsl_spmatrix_uchar_alloc_nzmax(nr, nc, nr*(1+algo->T*dim), GSL_SPMATRIX_COO);
     //open instance file
     sprintf(buffer, "%s/A.bin", instance_dir);
     fp = fopen(buffer, "wb");
-    //use constant IV = 0
-    XOF_init(IV);
-    //we rewrite ELISABETH_next, but without using the key state as a buffer
-    //init
-    for (i = 0; i < algo->N; i++) {
-        perm[i] = i;
-        w[i] = 0;
-    }
+    //Init elisabeth state, use constant IV = 0
+    ELISABETH_init(&es, algo, key, IV);
     //keystream generation
     for (i = 0; i < nr; i++) {
-        //update permutation and masks
-        for (j = 0; j < 5*algo->T; j++) {
-            r = XOF_int(j, algo->N);
-            // swap positions j and r
-            tmp = perm[j];
-            perm[j] = perm[r];
-            perm[r] = tmp;
-            // update mask of position j
-            w[perm[j]] = (w[perm[j]] + XOF_bits(algo->s)) % algo->n;
-        }
         //prepare to register the equation
         // init number of entries in equation
         entries[0] = 0;
         // init the constant term, this term accumulates:
-        // - the RHS of the equation (lsb of the filtering function applied to the selected masked key nibbles
+        // - the keystream bit
         // - the mask values of the nibbles added linearly, without going through h.
         // the constant terms in the anf of h appear in nibble specific variables.
-        cst = 0;
-        //for every component compute output LSB
+        cst = (ELISABETH_next(&es) & 1);
+        //for every component
         for (j = 0; j < algo->T; j++) {
-            // compute output LSB of this component and add it to cst
-            cst ^= (h((key[perm[5*j]] + w[perm[5*j]]) % algo->n,
-                    (key[perm[5*j+1]] + w[perm[5*j+1]]) % algo->n,
-                    (key[perm[5*j+2]] + w[perm[5*j+2]]) % algo->n,
-                    (key[perm[5*j+3]] + w[perm[5*j+3]]) % algo->n, algo) +
-                    key[perm[5*j+4]] + w[perm[5*j+4]]) & 1;
-            // add mask of affine contribution
-            cst ^= (w[perm[5*j+4]]) & 1;
+            // add the mask of the affine contribution to the constant term
+            cst ^= (es.w[es.perm[5*j+4]]) & 1;
             // compute ANF
             // first decompose info in perm into set selection and order
             // for example [7 2 4 9] nibble: [2 4 7 9] order [1 2 0 3]
             for (k = 0; k < 4; k++) {
                 pip[k].idx = k;
-                pip[k].val = perm[5*j+k];
+                pip[k].val = es.perm[5*j+k];
             }
             qsort(pip, 4, sizeof(int_pair), &cmp_int_pair);
             int_pair_extract_idx_nibble(&order, pip);
@@ -1237,27 +1263,27 @@ void buildInstance(variant *algo, char *variant_dir, char *instance_dir) {
             */
             // get the mask index
             for (idx_w = 0, k = 0; k < 4; k++)
-                idx_w = idx_w << algo->s | w[perm[5*j+k]];
-            
+                idx_w = idx_w << algo->s | es.w[es.perm[5*j+k]];
+
             // linear term
             // we use a property of the polynomialBasis: for a nibble set
             // [n_0, n_1, n_2, n_3], the lsb of nibble n_l appears in position
             // 1 + algo->s*(3-l) of the polynomial basis
-            entries[++entries[0]] = 2 + dim*nibbleIndex[perm[5*j+4]][0] + algo->s*(3-nibbleIndex[perm[5*j+4]][1]);
-            gsl_spmatrix_uchar_set(tA, entries[entries[0]], i, 1); 
+            entries[++entries[0]] = 2 + dim*nibbleIndex[es.perm[5*j+4]][0] + algo->s*(3-nibbleIndex[es.perm[5*j+4]][1]);
+            gsl_spmatrix_uchar_set(tA, entries[entries[0]], i, 1);
             // nibble quartet related monomials
             offset = 1 + dim*idx_nibble;
             for (k = 0; k < dim; k++) {
                 if (mzd_read_bit(perm_basis[idx_order], idx_w, k) == 1) {
                     entries[++entries[0]] = offset + k;
-                    gsl_spmatrix_uchar_set(tA, entries[entries[0]], i, 1); 
+                    gsl_spmatrix_uchar_set(tA, entries[entries[0]], i, 1);
                 }
             }
         }
         // constant term
         if (cst == 1) {
             entries[++entries[0]] = 0;
-            gsl_spmatrix_uchar_set(tA, entries[entries[0]], i, 1); 
+            gsl_spmatrix_uchar_set(tA, entries[entries[0]], i, 1);
         }
         // write row to output file
         if (fwrite(entries, sizeof(uint32_t), entries[0]+1, fp) != entries[0]+1) {
@@ -1299,6 +1325,547 @@ buildInstance_cleanup:
     if (tA) gsl_spmatrix_uchar_free(tA);
     if (ctA) gsl_spmatrix_uchar_free(ctA);
     if (abort) exit(2);
+}
+
+// Build an instance of the key recovery problem by linearisation for a variant of the Elisabeth
+// family, applying the filtering optimization
+// an instance directory is filled with
+// - a random key
+// - a sparse matrix A.bin and its transpose tA.bin, in a format that can be handled by cado-nfs/bwc
+// - a file tracking the dimension of the problem/size of matrix A
+// Random IVs are considered, the first generated nibble LSB provides an equation if it only
+// involves key nibbles of indexes i < Np
+void buildInstanceWithFiltering(variant *algo, char *variant_dir, char *instance_dir, int Np) {
+    int i, j, k, l;
+    mzd_t *polynomial_basis;
+    mzd_t *perm_basis[24];
+    char buffer[1024];
+    unsigned char key[256], iv[16];
+    unsigned char *ivs = NULL;
+    int nivs;
+    unsigned char *pivs = NULL;
+    int npivs;
+    int cnt;
+    int filter_ok;
+    nibble_t nibble, order;
+    int_pair pip[4];
+    FILE *fp = NULL;
+    rci_t dim;
+    uint8_t cst;
+    uint32_t entries[1 << 18]; // should be enough
+    int nc; // number of variables in the linearized system
+    int nr; // number of equations to collect
+    int idx_nibble, idx_order, idx_w;
+    int offset;
+    gsl_spmatrix_uchar *tA=NULL, *ctA=NULL;
+    int abort = 0;
+    ELI_state es;
+    //init nibbles
+    nibble_order_init(Np);
+    //for (i = 0; i < algo->N; i++) {
+    //    printf("nibbleIdx %d: %d, %d\n", i, nibbleIndex[i][0], nibbleIndex[i][1]);
+    //}
+    //load basis information
+    sprintf(buffer, "%s/basis.png", variant_dir);
+    polynomial_basis = mzd_from_png(buffer, 0);
+    dim = polynomial_basis->nrows;
+    //number of variables in the linearized system
+    //cst term + LSB of key nibbles i>=Np + polynomials in key nibble bits i < Np
+    printf("info %d %d %d %ld\n", algo->N, Np, dim, nibbles_len);
+    nc = 1 + (algo->N - Np) + dim * nibbles_len;
+    nr = nc + EXCESS;
+    //write dimensions
+    sprintf(buffer, "%s/dim.txt", instance_dir);
+    fp = fopen(buffer, "w");
+    if (fprintf(fp, "%d %d\n", nr, nc)<0) {
+        printf("Error writing matrix dimension, aborting\n");
+        abort = 1;
+        goto buildInstanceWithFiltering_cleanup;
+    }
+    fclose(fp); fp = NULL;
+    for (i = 0; i < 24; i++) {
+        perm_basis[i] = NULL;
+    }
+    for (i = 0; i < 24; i++) {
+        sprintf(buffer, "%s/anf-perm-%02d.png", variant_dir, i);
+        perm_basis[i] = mzd_from_png(buffer, 0);
+    }
+    //generate key and save key
+    genRandomByteString(key, algo->N);
+    for (i = 0; i < algo->N; i++) key[i] = key[i] % algo->n;
+    printf("KEY ");
+    for (i = 0; i < algo->N; i++) printf("%X", key[i]);
+    printf("\n");
+    sprintf(buffer, "%s/key.dat", instance_dir);
+    fp = fopen(buffer, "wb");
+    if (fwrite(key, sizeof(unsigned char), algo->N, fp) != algo->N) {
+        printf("Error writing key file, aborting\n");
+        abort = 1;
+        goto buildInstanceWithFiltering_cleanup;
+    }
+    fclose(fp); fp = NULL;
+    // Generate IVs
+    ivs = (unsigned char *) malloc((1 << 24) * sizeof(unsigned char));
+    nivs = 0;
+    cnt = 0;
+#pragma omp parallel private(pivs, npivs, j, k, filter_ok, es, iv) \
+//                     shared(ivs, nivs, nr, cnt, Np)
+{
+    pivs = (unsigned char *) malloc((1 << 24) * sizeof(unsigned char));
+    npivs = 0;
+    #pragma omp for schedule(dynamic)
+    for (i = 0; i < nr; i++) {
+        do {
+            //if (niv % 1000000 == 0) printf("%f, %d/%d\n", log(niv), i, nr);
+            //init Elisabeth from iv, to generate the first nibble of the sequence
+            genRandomByteString(iv, 16);
+            ELISABETH_init(&es, algo, key, iv);
+            ELISABETH_next(&es);
+            //filtering, for the time being, simple but could be generalized
+            filter_ok = 1;
+            for (j = 0; filter_ok && j < algo->T; j++) {
+                for (k = 0; filter_ok && k < 4; k++) {
+                    if (es.perm[5*j+k] >= Np)
+                        filter_ok = 0;
+                }
+            }
+        } while (!filter_ok);
+        memcpy(pivs + 16*npivs, iv, 16);
+        npivs += 1;
+        #pragma omp atomic
+        cnt++;
+        if ((cnt % 10) == 0) printf("%d\n", cnt);
+    }
+    #pragma omp critical
+    {
+        memcpy(ivs + 16*nivs, pivs, 16*npivs);
+        nivs += npivs;
+    }
+    free(pivs);
+}
+    // Generate keystream and system from IVs
+    // Alloc spmatrix
+    tA = gsl_spmatrix_uchar_alloc(nc, nr);
+    //open instance file
+    sprintf(buffer, "%s/A.bin", instance_dir);
+    fp = fopen(buffer, "wb");
+    for (i = 0; i < nr; i++) {
+        ELISABETH_init(&es, algo, key, ivs + 16*i);
+        //prepare to register the equation
+        // init number of entries in equation
+        entries[0] = 0;
+        // init the constant term, this term accumulates:
+        // - the keystream bit
+        // - the mask values of the nibbles added linearly, without going through h.
+        // the constant terms in the anf of h appear in nibble specific variables.
+        cst = (ELISABETH_next(&es) & 1);
+        //for every component compute output LSB
+        for (j = 0; j < algo->T; j++) {
+            // add mask of affine contribution
+            cst ^= (es.w[es.perm[5*j+4]]) & 1;
+            // compute ANF
+            // first decompose info in perm into set selection and order
+            // for example [7 2 4 9] nibble: [2 4 7 9] order [1 2 0 3]
+            for (k = 0; k < 4; k++) {
+                pip[k].idx = k;
+                pip[k].val = es.perm[5*j+k];
+            }
+            qsort(pip, 4, sizeof(int_pair), &cmp_int_pair);
+            int_pair_extract_idx_nibble(&order, pip);
+            int_pair_extract_val_nibble(&nibble, pip);
+            // get the nibble and order index
+            idx_nibble = binary_search(&nibble, nibbles, nibbles_len, sizeof(nibble_t), &cmp_nibble);
+            idx_order = binary_search(&order, permutations, 24, sizeof(nibble_t), &cmp_nibble);
+            /*
+            printf("nibble ");
+            for (k = 0; k < 5; k++) printf(" %d", perm[5*j+k]);
+            printf("\nset ");
+            print_nibble(nibbles + idx_nibble);
+            printf("\norder ");
+            print_nibble(permutations + idx_order);
+            printf("\n");
+            */
+            // get the mask index
+            for (idx_w = 0, k = 0; k < 4; k++)
+                idx_w = idx_w << algo->s | es.w[es.perm[5*j+k]];
+
+            // linear term
+            // case of a nibble >= Np
+            if (es.perm[5*j+4] >= Np)
+                entries[++entries[0]] = 1 + (es.perm[5*j+4] - Np);
+            // case of a nibble < Np, insert the contribution in a nibble system
+            else
+                entries[++entries[0]] = 2 + (algo->N - Np) + dim*nibbleIndex[es.perm[5*j+4]][0] + algo->s*(3-nibbleIndex[es.perm[5*j+4]][1]);
+            gsl_spmatrix_uchar_set(tA, entries[entries[0]], i, 1);
+            // nibble quartet related monomials
+            offset = 1 + (algo->N-Np) + dim*idx_nibble;
+            for (k = 0; k < dim; k++) {
+                if (mzd_read_bit(perm_basis[idx_order], idx_w, k) == 1) {
+                    entries[++entries[0]] = offset + k;
+                    gsl_spmatrix_uchar_set(tA, entries[entries[0]], i, 1);
+                }
+            }
+        }
+        // constant term
+        if (cst == 1) {
+            entries[++entries[0]] = 0;
+            gsl_spmatrix_uchar_set(tA, entries[entries[0]], i, 1);
+        }
+        // write row to output file
+        if (fwrite(entries, sizeof(uint32_t), entries[0]+1, fp) != entries[0]+1) {
+            printf("Error writing instance file, aborting\n");
+            abort = 1;
+            goto buildInstanceWithFiltering_cleanup;
+        }
+    }
+    //close instance file
+    fclose(fp); fp = NULL;
+    // make tA readable row by row
+    ctA = gsl_spmatrix_uchar_compress(tA, GSL_SPMATRIX_CSR);
+    // write tA to file using cado binary format
+    printf("Writing transpose matrix\n");
+    sprintf(buffer, "%s/tA.bin", instance_dir);
+    fp = fopen(buffer, "wb");
+    for (i = 0; i < nc; i++) {
+        entries[0] = 0;
+        for (l = ctA->p[i]; l < ctA->p[i+1]; l++) {
+            entries[++entries[0]] = ctA->i[l];
+        }
+        if (fwrite(entries, sizeof(uint32_t), entries[0]+1, fp) != entries[0]+1) {
+            printf("Error writing instance file, aborting\n");
+            abort = 1;
+            goto buildInstanceWithFiltering_cleanup;
+        }
+    }
+    printf("done\n");
+    fclose(fp); fp = NULL;
+
+buildInstanceWithFiltering_cleanup:
+    if (fp) fclose(fp);
+    // cleanup nibbles
+    nibble_order_free();
+    //clean basis information
+    for (i = 0; i < 24; i++) {
+        if (perm_basis[i])
+            mzd_free(perm_basis[i]);
+    }
+    if (tA) gsl_spmatrix_uchar_free(tA);
+    if (ctA) gsl_spmatrix_uchar_free(ctA);
+    if (ivs) free(ivs);
+    if (abort) exit(2);
+}
+
+// Inits an instance of the key recovery problem by linearisation
+// the instance directory must have been initialized with buildInstanceInit and contains a random key
+// Generates a random key in the instance directory
+void buildInstanceInit(variant *algo, char *instance_dir) {
+    int i;
+    char buffer[1024];
+    unsigned char key[256];
+    FILE *fp = NULL;
+    int abort = 0;
+    //generate key and save key
+    genRandomByteString(key, algo->N);
+    for (i = 0; i < algo->N; i++)
+        key[i] = key[i] % algo->n;
+    printf("KEY ");
+    for (i = 0; i < algo->N; i++)
+        printf("%X", key[i]);
+    printf("\n");
+    sprintf(buffer, "%s/key.dat", instance_dir);
+    fp = fopen(buffer, "wb");
+    if (fwrite(key, sizeof(unsigned char), algo->N, fp) != algo->N) {
+        printf("Error writing key file, aborting\n");
+        abort = 1;
+        goto bii_cleanup;
+    }
+
+bii_cleanup:
+    if (fp) fclose(fp);
+    if (abort) exit(2);
+}
+
+// Build an instance of the key recovery problem by linearisation for a variant of the Elisabeth
+// family, applying the filtering optimization
+// the instance directory must have been initialized with buildInstanceInit and contains a random key
+// Generates
+// - a sparse matrix A.bin and its transpose tA.bin, in a format that can be handled by cado-nfs/bwc
+// - a file tracking Na, Nb and the dimension of the problem/size of matrix A
+// Random IVs are considered, the first generated nibble LSB provides an equation if it only
+// involves key nibbles of indexes Na <= i < Nb
+void buildInstanceNext(variant *algo, char *variant_dir, char *instance_dir, int Na, int Nb) {
+    mzd_t *polynomial_basis;
+    mzd_t *perm_basis[24];
+    char buffer[1024];
+    unsigned char jobName[13];
+    unsigned char key[256], iv[16];
+    int cnt, lcnt;
+    int filter_ok;
+    nibble_t nibble, order;
+    int_pair pip[4];
+    int i, j, k;
+    FILE *fp = NULL;
+    rci_t dim;
+    uint8_t cst;
+    uint32_t *entries;
+    int nc; // number of variables in the linearized system
+    int nr; // number of equations to collect
+    int idx_nibble, idx_order, idx_w;
+    int offset;
+    int abort = 0;
+    ELI_state es;
+    //init nibbles
+    int Np = Nb - Na;
+    nibble_order_init(Np);
+    // read key
+    sprintf(buffer, "%s/key.dat", instance_dir);
+    fp = fopen(buffer, "rb");
+    if (!fp) {
+        fprintf(stderr, "ERROR: %s does not exist\n", buffer);
+        exit(1);
+    }
+    if (fread(key, sizeof(unsigned char), algo->N, fp) != algo->N) {
+        printf("Error reading key, aborting\n");
+        abort = 1;
+        goto bin_cleanup;
+    }
+    printf("KEY ");
+    for (i = 0; i < algo->N; i++) printf("%X", key[i]);
+    printf("\n");
+    // generate job name
+    genRandomJobName(jobName, sizeof(jobName)-1);
+    jobName[sizeof(jobName)-1] = '\0';
+    //load basis information
+    sprintf(buffer, "%s/basis.png", variant_dir);
+    polynomial_basis = mzd_from_png(buffer, 0);
+    dim = polynomial_basis->nrows;
+    //number of variables in the linearized system
+    //cst term + LSB of key nibbles i < Na or i >= Nb + polynomials in key nibble bits Na <= i < Nb
+    nc = 1 + (algo->N - Np) + dim * nibbles_len;
+    nr = nc + EXCESS;
+    //write dimensions in instance directory
+    sprintf(buffer, "%s/%s-dim.txt", instance_dir, jobName);
+    fp = fopen(buffer, "w");
+    if (fprintf(fp, "%d %d %d %d %d\n", Na, Nb, nr, nc, nr*(1+algo->T*(1+dim))) < 0) {
+        printf("Error writing matrix dimension, aborting\n");
+        abort = 1;
+        goto bin_cleanup;
+    }
+    fclose(fp);
+    fp = NULL;
+    // print useful information
+    printf("Job %s [%d:%d] matrix size %d\n", jobName, Na, Nb, 4*nr*algo->T*dim);
+    fflush(stdout);
+    // load bases
+    for (i = 0; i < 24; i++) {
+        perm_basis[i] = NULL;
+    }
+    for (i = 0; i < 24; i++) {
+        sprintf(buffer, "%s/anf-perm-%02d.png", variant_dir, i);
+        perm_basis[i] = mzd_from_png(buffer, 0);
+    }
+    // Generate keystream and system
+    cnt = 0;
+    abort = 0;
+#pragma omp parallel private(fp, cst, i, j, k, filter_ok, es, iv, buffer, pip, order, nibble, idx_nibble, idx_order, idx_w, entries, offset, lcnt) \
+//                     shared(instance_dir, jobName, algo, nr, cnt, Na, Nb, nibbles, permutations, abort)
+{
+    entries = NULL;
+    //open instance file
+    sprintf(buffer, "%s/%s-A-%d.bin", instance_dir, jobName, omp_get_thread_num());
+    fp = fopen(buffer, "wb");
+    if (!fp) {
+        printf("problem opening file, aborting\n");
+        abort = 1;
+    }
+    //alloc entries
+    entries = (uint32_t *) malloc((1 << 18)*sizeof(uint32_t));
+    if (!entries) {
+        printf("problem allocating entries array, aborting\n");
+        abort = 1;
+    }
+    lcnt = 0;
+    #pragma omp for schedule(dynamic)
+    for (i = 0; i < nr; i++) {
+        if (abort) continue;
+        // Generate an appropriate IV
+        do {
+            //init Elisabeth from iv, to generate the first nibble of the sequence
+            genRandomByteString(iv, 16);
+            ELISABETH_init(&es, algo, key, iv);
+            cst = ELISABETH_next(&es) & 1;
+            //filtering
+            filter_ok = 1;
+            for (j = 0; filter_ok && j < algo->T; j++) {
+                for (k = 0; filter_ok && k < 4; k++) {
+                    if (es.perm[5*j+k] >= Nb || es.perm[5*j+k] < Na)
+                        filter_ok = 0;
+                }
+            }
+        } while (!filter_ok);
+        //prepare to register the equation
+        // init number of entries in equation
+        entries[0] = 0;
+        // init the constant term, this term accumulates:
+        // - the keystream bit
+        // - the mask values of the nibbles added linearly, without going through h.
+        // the constant terms in the anf of h appear in nibble specific variables.
+        //for every component compute output LSB
+        for (j = 0; j < algo->T; j++) {
+            // add mask of affine contribution
+            cst ^= (es.w[es.perm[5*j+4]]) & 1;
+            // compute ANF
+            // first decompose info in perm into set selection and order
+            // for example [7 2 4 9] nibble: [2 4 7 9] order [1 2 0 3]
+            // to account for filtering, we shift the perm values by Na
+            for (k = 0; k < 4; k++) {
+                pip[k].idx = k;
+                pip[k].val = es.perm[5*j+k] - Na;
+            }
+            qsort(pip, 4, sizeof(int_pair), &cmp_int_pair);
+            int_pair_extract_idx_nibble(&order, pip);
+            int_pair_extract_val_nibble(&nibble, pip);
+            // get the nibble and order index
+            idx_nibble = binary_search(&nibble, nibbles, nibbles_len, sizeof(nibble_t), &cmp_nibble);
+            idx_order = binary_search(&order, permutations, 24, sizeof(nibble_t), &cmp_nibble);
+            /*
+            printf("nibble ");
+            for (k = 0; k < 5; k++) printf(" %d", perm[5*j+k]);
+            printf("\nset ");
+            print_nibble(nibbles + idx_nibble);
+            printf("\norder ");
+            print_nibble(permutations + idx_order);
+            printf("\n");
+            */
+            // get the mask index
+            for (idx_w = 0, k = 0; k < 4; k++)
+                idx_w = idx_w << algo->s | es.w[es.perm[5*j+k]];
+            // linear term
+            // case of a nibble < Na
+            if (es.perm[5*j+4] < Na)
+                entries[++entries[0]] = 1 + (es.perm[5*j+4]);
+            // case of a nibble >= Nb
+            else if (es.perm[5*j+4] >= Nb)
+                entries[++entries[0]] = 1 + (Na + es.perm[5*j+4] - Nb);
+            // case of a nibble in [Na:Nb], insert the contribution in a nibble system
+            else
+                entries[++entries[0]] = 2 + (algo->N - Np) + dim*nibbleIndex[es.perm[5*j+4]-Na][0] + algo->s*(3-nibbleIndex[es.perm[5*j+4]-Na][1]);
+            // nibble quartet related monomials
+            offset = 1 + (algo->N-Np) + dim*idx_nibble;
+            for (k = 0; k < dim; k++) {
+                if (mzd_read_bit(perm_basis[idx_order], idx_w, k) == 1) {
+                    entries[++entries[0]] = offset + k;
+                }
+            }
+        }
+        // constant term
+        if (cst == 1) {
+            entries[++entries[0]] = 0;
+        }
+        // write row to output file
+        if (fwrite(entries, sizeof(uint32_t), entries[0]+1, fp) != entries[0]+1) {
+            fprintf(stderr, "Error writing instance file, aborting\n");
+            abort = 1;
+        }
+        lcnt++;
+        if (lcnt % 500 == 0)
+        {
+            #pragma omp critical
+            {
+            cnt += lcnt;
+            lcnt = 0;
+            fprintf(stderr, "Progress: %d/%d\r", cnt, nr);
+            fflush(stderr);
+            }
+        }
+    }
+    //close instance file
+    fclose(fp); fp = NULL;
+    if (entries) {
+        free(entries);
+        entries = NULL;
+    }
+}
+
+bin_cleanup:
+    if (fp) fclose(fp);
+    // cleanup nibbles
+    nibble_order_free();
+    //clean basis information
+    for (i = 0; i < 24; i++) {
+        if (perm_basis[i])
+            mzd_free(perm_basis[i]);
+    }
+    if (abort) exit(2);
+}
+
+//Finalize the creation of an instance
+//Essentially performs the transposition of <jobName>-A.bin
+void buildInstanceFinalize(variant *algo, char *variant_dir, char *instance_dir, char *jobname) {
+    int Na, Nb, nr, nc, nzmax, i, j, k, l, nentry, abort = 0;
+    gsl_spmatrix_uchar *tA=NULL, *ctA=NULL;
+    char buffer[1024];
+    FILE *fp = NULL;
+    uint32_t entries[1 << 18]; // should be large enough
+    // read dimensions and key nibble subset target
+    sprintf(buffer, "%s/%s-dim.txt", instance_dir, jobname);
+    fp = fopen(buffer, "r");
+    if (fscanf(fp, "%d %d %d %d %d\n", &Na, &Nb, &nr, &nc, &nzmax) != 5) {
+        printf("Problem reading dimensions for %s, aborting\n", jobname);
+        abort = 1;
+        goto bif_cleanup;
+    }
+    fclose(fp); fp = NULL;
+
+    // Alloc spmatrix
+    tA = gsl_spmatrix_uchar_alloc_nzmax(nc, nr, nzmax, GSL_SPMATRIX_COO);
+    // read A matrix and fill tA matrix from A
+    printf("Reading matrix\n");
+    sprintf(buffer, "%s/%s-A.bin", instance_dir, jobname);
+    fp = fopen(buffer, "rb");
+    nentry = 0; // number of entries left to read in equation j
+    j = -1; //equation number
+    while(!feof(fp)) {
+        if (fread(&k, sizeof(uint32_t), 1, fp) != 1) {
+            if (feof(fp)) continue;
+            printf("Problem reading next entry, aborting\n");
+            abort = 1;
+            goto bif_cleanup;
+        }
+        if (nentry == 0) {
+            // Start handling next row
+            nentry = k;
+            j++;
+            continue;
+        }
+        gsl_spmatrix_uchar_set(tA, k, j, 1);
+        nentry--;
+    }
+    fclose(fp); fp = NULL;
+    // make tA readable row by row
+    ctA = gsl_spmatrix_uchar_compress(tA, GSL_SPMATRIX_CSR);
+    // write tA to file using cado binary format
+    printf("Writing transpose matrix\n");
+    sprintf(buffer, "%s/%s-tA.bin", instance_dir, jobname);
+    fp = fopen(buffer, "wb");
+    for (i = 0; i < nc; i++) {
+        entries[0] = 0;
+        for (l = ctA->p[i]; l < ctA->p[i+1]; l++) {
+            entries[++entries[0]] = ctA->i[l];
+        }
+        if (fwrite(entries, sizeof(uint32_t), entries[0]+1, fp) != entries[0]+1) {
+            printf("Error writing instance file, aborting\n");
+            abort = 1;
+            goto bif_cleanup;
+        }
+    }
+bif_cleanup:
+    if (fp)
+        fclose(fp);
+    if (tA) gsl_spmatrix_uchar_free(tA);
+    if (ctA) gsl_spmatrix_uchar_free(ctA);
+    if (abort)
+        exit(2);
 }
 
 // Checks an intance of the problem
@@ -1365,13 +1932,6 @@ void checkInstance(variant *algo, char *variant_dir, char *instance_dir) {
         mzd_copy(win, tmpp);
         mzd_free_window(win);
     }
-    // print the polynomial key
-    printf("polynomial key: [");
-    for (i = 0; i < L; i++) {
-        if (i > 0) printf(", ");
-        printf("%x",mzd_read_bit(monomial_key, i, 0));
-    }
-    printf("]\n");
     // read instance
     sprintf(buffer, "%s/A.bin", instance_dir);
     fp = fopen(buffer, "rb");
@@ -1405,10 +1965,129 @@ void checkInstance(variant *algo, char *variant_dir, char *instance_dir) {
                     printf("Check Equation %d: %s\n", j, "KO");
                 //printf("Check Equation %d: %s\n", j, sum == 0 ? "OK" : "KO");
         }
-        
     }
     printf("Checked %d equations\n", j);
 cleanup:
+    nibble_order_free();
+    monomial_order_free();
+    if (tmp) mzd_free(tmp);
+    if (tmpp) mzd_free(tmpp);
+    if (polynomial_basis) mzd_free(polynomial_basis);
+    mzd_free(monomial_key);
+    if (abort) exit(2);
+}
+
+
+// Checks an intance of the problem with filtering
+// - read the key
+// - read the polynomial basis matrix
+// - build the extended key, ie evaluate the polynomial basis matrix on the key bits
+// - read the system
+// - check the extended key is in the kernel of the system matrix
+void checkInstanceWithFiltering(variant *algo, char *variant_dir, char *instance_dir, int Np) {
+    unsigned char key[256];
+    char buffer[1024];
+    int i, j, K, b;
+    uint32_t k;
+    int dim;
+    int N = 1 << (algo->s*4);
+    int L;
+    FILE *fp;
+    int nentry, sum;
+    int abort = 0;
+    nibble_t lkey;
+    mzd_t *polynomial_basis = NULL, *monomial_key = NULL, *tmp = NULL, *tmpp = NULL, *win;
+    nibble_order_init(Np);
+    monomial_order_init(algo->s*4);
+    // read key
+    sprintf(buffer, "%s/key.dat", instance_dir);
+    fp = fopen(buffer, "rb");
+    if (fread(key, sizeof(unsigned char), algo->N, fp) != algo->N) {
+        printf("Error reading key, aborting\n");
+        abort = 1;
+        goto ciwf_cleanup;
+    }
+    printf("KEY ");
+    for (i = 0; i < algo->N; i++) printf("%X", key[i]);
+    printf("\n");
+    // read polynomial basis
+    sprintf(buffer, "%s/basis.png", variant_dir);
+    polynomial_basis = mzd_from_png(buffer, 0);
+    // allocate tmp vectors
+    dim = polynomial_basis->nrows;
+    L = 1 + (algo->N - Np) + dim * nibbles_len;
+    printf("Number of variables: %d\n", L);
+    monomial_key = mzd_init(L, 1);
+    tmp = mzd_init(N, 1);
+    tmpp = mzd_init(dim, 1);
+    // build derived monomial vector
+    // set beginning of monomial key
+    mzd_write_bit(monomial_key, 0, 0, 1);
+    for (i = Np; i < algo->N; i++)
+        mzd_write_bit(monomial_key, 1 + i-Np, 0, key[i] & 1);
+    // for every nibble set
+    for (i = 0; i < nibbles_len; i++) {
+        // extract the key nibbles
+        for (j = 0, K = 0; j < 4; j++) {
+            lkey[j] = key[nibbles[i][j]];
+            K = (K << algo->s) | lkey[j];
+        }
+        // form the monomial vector
+        for (j = 0; j < N; j++)
+            mzd_write_bit(tmp, j, 0, (j & K) == j ? 1 : 0);
+        // reoder monomials
+        mzd_apply_p_left(tmp, P2NMO);
+        // project on polynomial basis
+        mzd_mul(tmpp, polynomial_basis, tmp, 0);
+        // save in monomial key
+        win = mzd_init_window (monomial_key, 1 + (algo->N-Np) + dim*i, 0,
+                                             1 + (algo->N-Np) + dim*i+dim, 1);
+        mzd_copy(win, tmpp);
+        mzd_free_window(win);
+    }
+    // print the polynomial key
+    printf("polynomial key: [");
+    for (i = 0; i < L; i++) {
+        if (i > 0) printf(", ");
+        printf("%x",mzd_read_bit(monomial_key, i, 0));
+    }
+    printf("]\n");
+    // read instance
+    sprintf(buffer, "%s/A.bin", instance_dir);
+    fp = fopen(buffer, "rb");
+    nentry = 0; // number of entries left to read in equation j
+    sum = -1; //current value of equation evaluation, -1 : undefined
+    j = -1; //equation number
+    while(!feof(fp)) {
+        if (fread(&k, sizeof(uint32_t), 1, fp) != 1) {
+            if (feof(fp)) continue;
+            printf("Problem reading next entry, aborting\n");
+            abort = 1;
+            goto ciwf_cleanup;
+        }
+        if (nentry == 0) {
+            // Start handling next equation
+            nentry = k;
+            j++;
+            //printf("Equation %d: %d entries\n", j, nentry);
+            sum = 0;
+            continue;
+        }
+        b = mzd_read_bit(monomial_key, k, 0);
+        sum ^= b;
+        //printf("Equation %d: %d %d\n", j, k, b);
+        nentry--;
+        // Finish handling equation j
+        if (nentry == 0) {
+            // check that the monomial vector is in the (right) kernel of the matrix
+            if (sum != -1)
+                if (sum == 1)
+                    printf("Check Equation %d: %s\n", j, "KO");
+                //printf("Check Equation %d: %s\n", j, sum == 0 ? "OK" : "KO");
+        }
+    }
+    printf("Checked %d equations\n", j);
+ciwf_cleanup:
     nibble_order_free();
     monomial_order_free();
     if (tmp) mzd_free(tmp);
@@ -1422,7 +2101,7 @@ int auxReadInstance(int nr, int nc, FILE *fout, FILE *fin, char *matname)
 {
     mzd_t *mat = NULL;
     int nentry;
-    int i, j;
+    int j;
     uint32_t k;
     int abort = 0;
 
@@ -1445,7 +2124,9 @@ int auxReadInstance(int nr, int nc, FILE *fout, FILE *fin, char *matname)
         mzd_write_bit(mat, j, k, 1);
         nentry--;
     }
+    mzd_to_png(mat, "glop.png", 0, NULL, 0);
     // print matrix
+    /*
     fprintf(fout, "%s = matrix(GF(2), %d, %d, [", matname, mat->nrows, mat->ncols);
     for (i = 0; i < mat->nrows; i++) {
         for (j = 0; j < mat->ncols; j++) {
@@ -1454,6 +2135,7 @@ int auxReadInstance(int nr, int nc, FILE *fout, FILE *fin, char *matname)
         }
     }
     fprintf(fout, "])\n");
+    */
 aux_cleanup:
     if (mat) mzd_free(mat);
     return abort;
@@ -1485,6 +2167,7 @@ void readInstance(variant *algo, char *variant_dir, char *instance_dir)
         goto readInstance_cleanup;
     }
     fclose(fin); fin = NULL;
+    /*
     sprintf(buffer, "%s/tA.bin", instance_dir);
     fin = fopen(buffer, "rb");
     if (auxReadInstance(nc, nr, fout, fin, "tA")) {
@@ -1493,6 +2176,7 @@ void readInstance(variant *algo, char *variant_dir, char *instance_dir)
         goto readInstance_cleanup;
     }
     fclose(fin); fin = NULL;
+    */
 readInstance_cleanup:
     if (fin) fclose(fin);
     if (fout) fclose(fout);
@@ -1521,21 +2205,34 @@ void readPolynomialBasisMatrix(variant *algo, char *variant_dir) {
 }
 
 // reads the solution of an attacked instance. This a file output by cado-nfs/bwc
-uint64_t *readSolution(char *instance_dir, int transpose, int *len, int *dim)
+uint64_t *readSolution(char *instance_dir, int transpose, int *len, int *dim, char *job_name)
 {
     FILE *fp = NULL;
     char buffer[1024];
     int i, nr, nc, n, d = 0;
+    int Na, Nb, nzmax;
     int abort = 0;
     uint64_t *res = NULL, acc = 0;
 
-    sprintf(buffer, "%s/dim.txt", instance_dir);
-    fp = fopen(buffer, "r");
-    if(fscanf(fp, "%d %d\n", &nr, &nc) != 2) {
-        abort = 1;
-        goto readSolution_cleanup;
+    if (job_name != NULL) {
+        sprintf(buffer, "%s/%s-dim.txt", instance_dir, job_name);
+        fp = fopen(buffer, "r");
+        if (fscanf(fp, "%d %d %d %d %d\n", &Na, &Nb, &nr, &nc, &nzmax) != 5) {
+            printf("Problem reading dimensions for %s, aborting\n", job_name);
+            abort = 1;
+            goto readSolution_cleanup;
+        }
+        fclose(fp); fp = NULL;
     }
-    fclose(fp); fp = NULL;
+    else {
+        sprintf(buffer, "%s/dim.txt", instance_dir);
+        fp = fopen(buffer, "r");
+        if(fscanf(fp, "%d %d\n", &nr, &nc) != 2) {
+            abort = 1;
+            goto readSolution_cleanup;
+        }
+        fclose(fp); fp = NULL;
+    }
     if (transpose)
         n = nc;
     else
@@ -1545,7 +2242,11 @@ uint64_t *readSolution(char *instance_dir, int transpose, int *len, int *dim)
         goto readSolution_cleanup;
     }
     // read the solution space in memory
-    sprintf(buffer, "%s/W", instance_dir);
+    if (job_name != NULL) {
+        sprintf(buffer, "%s/%s-W", instance_dir, job_name);
+    } else {
+        sprintf(buffer, "%s/W", instance_dir);
+    }
     fp = fopen(buffer, "rb");
     for (i = 0; i < n; i++) {
         if (fread(res + i, sizeof(uint64_t), 1, fp) != 1) {
@@ -1581,7 +2282,7 @@ void printSolution(char *instance_dir)
     uint64_t *sol;
     int dim;
 
-    if (!(sol = readSolution(instance_dir, 0, &n, &dim))) {
+    if (!(sol = readSolution(instance_dir, 0, &n, &dim, NULL))) {
         printf("Problem reading solution, aborting\n");
         goto printSolution_cleanup;
     }
@@ -1597,16 +2298,326 @@ printSolution_cleanup:
     if (sol) free(sol);
 }
 
+int auxExtractKey(variant *algo, uint8_t *lkey, uint8_t *solVec, mzd_t *M)
+{
+    int i, j, l;
+    int pkey = 0;
+    int candidates[16], cur, n = 0;
+    //extract the LSBs
+    for (i = 0; i < 4; i++) {
+        for (j = 0; j < algo->s-1; j++) {
+            //bits[(3-i)*algo->s + j] = solVec[1 + i*algo->s + j];
+            if (solVec[1 + i*algo->s + j]) // bits[(3-i)*algo->s + j])
+                pkey |= (1 << (i*algo->s + j));
+        }
+    }
+    //generate list of MSBs candidates
+    for (i = 0; i < 16; i++) {
+        candidates[i] = 0;
+    }
+    for (l = 1, cur = (1 << (algo->s-1)); l < 16; l*=2, cur <<= algo->s) {
+        for (i = 0; i < 16; i += 2*l) {
+            for (j = 0; j < l; j++) {
+                candidates[i+j+l] |= cur;
+            }
+        }
+    }
+    //Exhaust the MSBs
+    for (i = 0; i < 16; i++) {
+        // candidate key (for this nibble)
+        cur = pkey ^ candidates[i];
+        for (j = 0; j < M->nrows; j++) {
+            if (solVec[j] != mzd_read_bit(M, j, cur)) break;
+        }
+        if (j != M->nrows) continue;
+        // candidate found
+        for (j = 0; j < 4; j++) {
+            lkey[4*n + j] = (cur >> ((3-j)*algo->s)) % (1 << algo->s);
+        }
+        n++;
+    }
+    return n;
+}
+
+#define MAX_N 64
+#define NIBBLE_NOT_SET -1
+//enough space to allow for N = 64
+#define MAX_NIBBLE_LEN (1<<20)
+typedef struct _state_backtracking {
+    int nspec; // number of key nibbles specified at this stage
+    int spec[4]; // index of key nibbles specified at this stage
+    int choice;
+} state_backtracking;
+
+void print_state_bt(state_backtracking *st)
+{
+    int j;
+    printf("%d [", st->nspec);
+    for (j = 0; j < st->nspec; j++) {
+        printf(" %d", st->spec[j]);
+    }
+    printf("] %d\n", st->choice);
+}
+
+// reads and print out the solution of an attacked instance
+void extractKey(variant *algo, char *variant_dir, char *instance_dir, char *job_name)
+{
+    int i, j, n, dim, J;
+    int Na, Nb, Np;
+    uint64_t *sol = NULL;
+    uint8_t *solVec = NULL;
+    int *nlkey = NULL;
+    uint8_t *lkey = NULL, *lkeycur;
+    mzd_t *B = NULL, *M = NULL, *Mtmp = NULL;
+    int nr, nc, nzmax;
+    char fname[1024];
+    FILE *fp;
+    unsigned char real_key[256];
+    int key[MAX_N];
+    state_backtracking *state = NULL;;
+    int depth;
+
+    // read dimensions and key nibble subset target
+    if (job_name != NULL) {
+        sprintf(fname, "%s/%s-dim.txt", instance_dir, job_name);
+        fp = fopen(fname, "r");
+        if (fscanf(fp, "%d %d %d %d %d\n", &Na, &Nb, &nr, &nc, &nzmax) != 5) {
+            printf("Problem reading dimensions for %s, aborting\n", job_name);
+            goto extractKey_cleanup;
+        }
+        Np = Nb - Na;
+        fclose(fp); fp = NULL;
+    }
+    else {
+        Np = algo->N;
+    }
+
+    nibble_order_init(Np);
+    monomial_order_init(algo->s*4);
+
+    // load polynomial basis
+    sprintf(fname, "%s/basis.png", variant_dir);
+    B = mzd_from_png(fname, 0);
+
+    // read key
+    sprintf(fname, "%s/key.dat", instance_dir);
+    fp = fopen(fname, "rb");
+    if (fread(real_key, sizeof(unsigned char), algo->N, fp) != algo->N) {
+        printf("Error reading key, aborting\n");
+        goto extractKey_cleanup;
+    }
+    printf("KEY ");
+    for (i = 0; i < algo->N; i++) printf("%X", real_key[i]);
+    printf("\n");
+
+    // read solution basis
+    if (!(sol = readSolution(instance_dir, 0, &n, &dim, job_name))) {
+        printf("Problem reading solution, aborting\n");
+        goto extractKey_cleanup;
+    }
+    if (dim > 10) {
+        printf("Solution space dimension too large (2^%d), aborting\n", n);
+        goto extractKey_cleanup;
+    }
+    if (!(solVec = (uint8_t *) malloc(sizeof(uint8_t)*n))) {
+        printf("Problem allocating solution vector, aborting\n");
+        goto extractKey_cleanup;
+    }
+    // Allocate space to store the partial solutions
+    // hope for less than 4 solutions per nibble on average
+    lkey = (uint8_t *) malloc(sizeof(uint8_t) * 4 * 4 * nibbles_len);
+    nlkey = (int *) malloc(sizeof(int) * (nibbles_len+1));
+    if (!lkey || !nlkey) {
+        printf("Problem allocating local key candidates, aborting\n");
+        goto extractKey_cleanup;
+    }
+    // Allocating space for the backtracking stack
+    state = (state_backtracking *) malloc(MAX_NIBBLE_LEN * sizeof(state_backtracking));
+    if (!state) {
+        printf("Problem allocating backtracking stack, aborting\n");
+        goto extractKey_cleanup;
+    }
+    // Precompute polynomial vectors corresponding to key nibbles
+    //   Generate monomial matrix
+    M = identityMatrix(1 << (4*algo->s));
+    applyMobius(M);
+    //   Reorder monomials
+    mzd_apply_p_left(M, P2NMO);
+    // project on the polynomial basis
+    Mtmp = mzd_mul(NULL, B, M, 0);
+    // Look up for the solution
+    for (i = 0; i < (1 << dim); i++) {
+        // combine solution vectors determined by the bits of i
+        for (j = 0; j < n; j++) {
+            solVec[j] = __builtin_parity(i & sol[j]);
+        }
+        // check the constant term
+        if (solVec[0] != 1)
+            continue;
+        // for all nibbles extract the local solution for the nibble
+        nlkey[0] = 0;
+        for (j = 0; j < nibbles_len; j++) {
+            nlkey[j+1] = nlkey[j] + auxExtractKey(algo, lkey + 4*nlkey[j],
+                    solVec + 1 + algo->N-Np + B->nrows*j, Mtmp);
+            // no candidate solution found for this nibble, aborting exploration for
+            // this value of dim
+            if (nlkey[j+1] == nlkey[j])
+                break;
+        }
+        // if no candidate found for one nibble, abort the considered i value
+        if (j < nibbles_len)
+            continue;
+        printf("Candidates found for all nibbles, merging\n");
+        // candidates found for all nibbles, merge to get candidates for the whole key
+        // by backtracking.
+        // setup initial state
+        for (j = 0; j < Np; j++) {
+            key[j] = NIBBLE_NOT_SET;
+        }
+        depth = 0;
+        state[0].nspec = 0;
+        state[0].choice = nlkey[0];
+        // backtracking
+        while (depth >= 0) {
+            // case of a leaf, print out the key
+            if (depth == nibbles_len) {
+                printf("SOL ");
+                for (j = 0; j < algo->N; j++)
+                    if (j < Na || j >= Nb)
+                        printf("*");
+                    else
+                        printf("%d", key[j-Na]);
+                printf("\n");
+            }
+            // case of a leaf or a node with all children have been explored, backtrack
+            if (depth == nibbles_len || state[depth].choice >= nlkey[depth+1]) {
+                for (j = 0; j < state[depth].nspec; j++) {
+                    J = state[depth].spec[j];
+                    key[nibbles[depth-1][J]] = NIBBLE_NOT_SET;
+                }
+                depth--;
+                continue;
+            }
+            // consider the next children choice
+            lkeycur = lkey + 4*state[depth].choice;
+            state[depth+1].nspec = 0;
+            for (j = 0; j < 4; j++) {
+                if (key[nibbles[depth][j]] == NIBBLE_NOT_SET) {
+                    state[depth+1].spec[state[depth+1].nspec++] = j;
+                } else if (key[nibbles[depth][j]] != lkeycur[j]) {
+                    break;
+                }
+            }
+            // remember that this children choice has been analyzed
+            state[depth].choice++;
+            // if the choice is not consistent, go to next choice
+            if (j < 4)
+                continue;
+            // Setup the consistent choice selection and iterate
+            for (j = 0; j < state[depth+1].nspec; j++) {
+                J = state[depth+1].spec[j];
+                key[nibbles[depth][J]] = lkeycur[J];
+            }
+            state[depth+1].choice = nlkey[depth+1];
+            depth++;
+        }
+    }
+
+extractKey_cleanup:
+    nibble_order_free();
+    monomial_order_free();
+    if (sol) free(sol);
+    if (B) mzd_free(B);
+    if (M) mzd_free(M);
+    if (Mtmp) mzd_free(Mtmp);
+    if (lkey) free(lkey);
+    if (nlkey) free(nlkey);
+    if (state) free(state);
+}
+
+// Checks the solution of an intance of the problem with filtering
+// - read the solution vectors
+// - read the system
+// - check the solution vectors statisfy the system
+void checkSolutionInstanceWithFiltering(variant *algo, char *instance_dir) {
+    char buffer[1024];
+    int i, j, b;
+    uint32_t k;
+    uint64_t *sol=NULL;
+    int n, dim;
+    FILE *fp = NULL;
+    int nentry, sum;
+    int abort = 0;
+    // read solution
+    if (!(sol = readSolution(instance_dir, 0, &n, &dim, NULL))) {
+        printf("Problem reading solution, aborting\n");
+        abort = 1;
+        goto csiwf_cleanup;
+    }
+    for (i = 0; i < dim; i++) {
+        // read instance
+        sprintf(buffer, "%s/A.bin", instance_dir);
+        fp = fopen(buffer, "rb");
+        nentry = 0; // number of entries left to read in equation j
+        sum = -1; //current value of equation evaluation, -1 : undefined
+        j = -1; //equation number
+        while(!feof(fp)) {
+            if (fread(&k, sizeof(uint32_t), 1, fp) != 1) {
+                if (feof(fp)) continue;
+                printf("Problem reading next entry, aborting\n");
+                abort = 1;
+                goto csiwf_cleanup;
+            }
+            if (nentry == 0) {
+                // Start handling next equation
+                nentry = k;
+                j++;
+                //printf("Equation %d: %d entries\n", j, nentry);
+                sum = 0;
+                continue;
+            }
+            b = (sol[k] >> i) & 1;
+            sum ^= b;
+            //printf("Equation %d: %d %d\n", j, k, b);
+            nentry--;
+            // Finish handling equation j
+            if (nentry == 0) {
+                // check that the vector is in the (right) kernel of the matrix
+                if (sum != -1)
+                    if (sum == 1)
+                        printf("Check Equation %d: %s\n", j, "KO");
+                    //printf("Check Equation %d: %s\n", j, sum == 0 ? "OK" : "KO");
+            }
+        }
+        fclose(fp);
+        fp = NULL;
+        printf("Checked %d equations\n", j);
+    }
+csiwf_cleanup:
+    if (sol) free(sol);
+    if (fp) fclose(fp);
+    if (abort) exit(2);
+}
+
 void usage()
 {
     printf("Usage:\n");
+    printf("  * keystream: generate keystream from a test key \n");
+    printf("  * buildPolynomialBasisMatrix: build the polynomial basis matrix for the active variant\n");
+    printf("  * buildBasisMatrices: build the basis matrices of functions h\n");
+    printf("  * buildInstance: generate key and build an instance of a linearized system (without filtering)\n");
+    printf("  * checkInstance: check the consistency of the key and the sytem of an instance\n");
+    printf("  * buildInstanceInit: generate key of an instance with filtering\n");
+    printf("  * buildInstanceNext: generate system of an instance with filtering\n");
+    printf("  * buildInstanceFinalize: transposes a system of an instance with filtering\n");
+    printf("  * extractKey: extract the elisabeth key from the BW solution space W to a linearized system\n");
+
+/* TODO: advertize intermediate functions ?
     printf("  * genGMatrix: TODO\n");
     printf("  * genHMatrix: TODO\n");
     printf("  * genHMatrixTxt: TODO\n");
     printf("  * testMobius: TODO\n");
     printf("  * gMatrixRank: TODO\n");
-    printf("  * buildPolynomialBasisMatrix: TODO\n");
-    printf("  * buildBasisMatrices: TODO\n");
     printf("  * buildBasisHMatrix: TODO\n");
     printf("  * testBasisMatrices: TODO\n");
     printf("  * reorderMonomials: TODO\n");
@@ -1615,13 +2626,11 @@ void usage()
     printf("  * testAltMonomialOrder: TODO\n");
     printf("  * testAltMonomialReorder: TODO\n");
     printf("  * testImplem: TODO\n");
-    printf("  * keystream: TODO\n");
     printf("  * testNibbleOrder: TODO\n");
-    printf("  * buildInstance: TODO\n");
-    printf("  * checkInstance: TODO\n");
     printf("  * readInstance: TODO\n");
     printf("  * readPolynomialBasisMatrix: TODO\n");
     printf("  * printSolution: TODO\n");
+*/
 }
 
 int main(int argc, char **argv)
@@ -1770,7 +2779,7 @@ int main(int argc, char **argv)
         mzd_t *A, *B;
         ord_drl = morder_init(nvar, &drevlex);
         ord_sbl = morder_init(nvar, &sblex);
-        
+
         A = mzd_from_png(argv[3], 0);
         B = mzd_copy(NULL, A);
         B = morder_reorder_columns(ord_drl->inv_P, B, 0);
@@ -1797,12 +2806,14 @@ int main(int argc, char **argv)
     // Generate keystream for test key
     else if (!strcmp(argv[1], "keystream")) {
         int i, n = atoi(argv[2]);
-        ELISABETH_init(activeVariant, KEY, IV);
-        for (i = 0; i < n; i++)
-            printf("%x", ELISABETH_next(activeVariant));
+        ELI_state es;
+        ELISABETH_init(&es, activeVariant, KEY, IV);
+        for (i = 0; i < n; i++) {
+            printf("%x", ELISABETH_next(&es));
+        }
         printf("\n");
     }
-    
+
     else if (!strcmp(argv[1], "testNibbleOrder")) {
         int i, j, jp;
         srandom(time(NULL));
@@ -1828,7 +2839,17 @@ int main(int argc, char **argv)
         }
         buildInstance(activeVariant, argv[2], argv[3]);
     }
-
+    else if (!strcmp(argv[1], "buildInstanceWithFiltering")) {
+        if (argc != 5) {
+            printf("%s buildInstance variant_dir instance_dir N'\n", argv[0]);
+            printf("    * variant_dir    a directory containing the polynomial basis and the precomputed ANF\n");
+            printf("                     for all permutations\n");
+            printf("    * instance_dir   a directory where the built instance will be stored\n");
+            printf("    * N'             the number of key nibbles to consider in the attack\n");
+            return 2;
+        }
+        buildInstanceWithFiltering(activeVariant, argv[2], argv[3], atoi(argv[4]));
+    }
     else if (!strcmp(argv[1], "checkInstance")) {
         if (argc != 4) {
             printf("%s checkInstance variant_dir instance_dir\n", argv[0]);
@@ -1839,12 +2860,24 @@ int main(int argc, char **argv)
         }
         checkInstance(activeVariant, argv[2], argv[3]);
     }
+    else if (!strcmp(argv[1], "checkInstanceWithFiltering")) {
+        if (argc != 5) {
+            printf("%s checkInstanceWithFiltering variant_dir instance_dir N'\n", argv[0]);
+            printf("    * variant_dir    a directory containing the polynomial basis\n");
+            printf("                     and the precomputed ANF for all permutations\n");
+            printf("    * instance_dir   a directory where the instance to test can be found\n");
+            printf("    * N'             the number of key nibbles considered in the attack\n");
+            return 2;
+        }
+        checkInstanceWithFiltering(activeVariant, argv[2], argv[3], atoi(argv[4]));
+    }
+
 
     else if (!strcmp(argv[1], "readInstance")) {
         if (argc != 4) {
             printf("%s readInstance variant_dir instance_dir\n", argv[0]);
             printf("    * variant_dir    a directory containing the polynomial basis\n");
-            printf("                     and the precomputed ANF for all permutations\n");
+            printf("                     and the precomputed anf for all permutations\n");
             printf("    * instance_dir   a directory where the instance to test can be found\n");
             return 2;
         }
@@ -1870,6 +2903,62 @@ int main(int argc, char **argv)
         }
         printSolution(argv[2]);
     }
+    else if (!strcmp(argv[1], "extractKey")) {
+        char *job_name = NULL;
+        if (argc != 4 && argc != 5) {
+            printf("%s extractKey variant_dir instance_dir\n", argv[0]);
+            printf("    * variant_dir          a directory containing the polynomial basis\n");
+            printf("                           and the precomputed anf for all permutations\n");
+            printf("    * instance_dir:        a directory containing the solution file [<job_name>-]W\n");
+            printf("    * [optional] job_name: in case of a system build with filtering, the job_name\n");
+            return 2;
+        }
+        if (argc == 5)
+            job_name = argv[4];
+        extractKey(activeVariant, argv[2], argv[3], job_name);
+    }
 
+    else if (!strcmp(argv[1], "checkSolutionInstanceWithFiltering")) {
+        if (argc != 3) {
+            printf("%s checkSolutionInstanceWithFiltering instance_dir\n", argv[0]);
+            printf("    * instance_dir   a directory where the instance to test can be found\n");
+            return 2;
+        }
+        checkSolutionInstanceWithFiltering(activeVariant, argv[2]);
+    }
+
+    else if (!strcmp(argv[1], "buildInstanceInit")) {
+        if (argc != 3) {
+            printf("%s buildInstanceInit instance_dir\n", argv[0]);
+            printf("    * instance_dir   a directory where to create the instance \n");
+            return 2;
+        }
+        buildInstanceInit(activeVariant, argv[2]);
+    }
+
+    else if (!strcmp(argv[1], "buildInstanceNext")) {
+        if (argc != 6) {
+            printf("%s buildInstanceNext variant_dir instance_dir Na Nb\n", argv[0]);
+            printf("    * variant_dir    a directory containing the polynomial basis\n");
+            printf("                     and the precomputed anf for all permutations\n");
+            printf("    * instance_dir   the directory containing the instance \n");
+            printf("    * Na, Nb         the key nibbles retained for the filtering are in\n");
+            printf("                     subset {Na, ..., Nb-1}\n");
+            return 2;
+        }
+        buildInstanceNext(activeVariant, argv[2], argv[3], atoi(argv[4]), atoi(argv[5]));
+    }
+
+    else if (!strcmp(argv[1], "buildInstanceFinalize")) {
+        if (argc != 5) {
+            printf("%s buildInstanceFinalize variant_dir instance_dir Na Nb\n", argv[0]);
+            printf("    * variant_dir        a directory containing the polynomial basis\n");
+            printf("                         and the precomputed anf for all permutations\n");
+            printf("    * instance_dir       the directory containing the instance \n");
+            printf("    * job_name           the job name generated by the call to buildInstanceNext\n");
+            return 2;
+        }
+        buildInstanceFinalize(activeVariant, argv[2], argv[3], argv[4]);
+    }
     return EXIT_SUCCESS;
 }

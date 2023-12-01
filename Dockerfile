@@ -7,6 +7,7 @@ RUN apt-get update                                                 && \
         libgsl-dev                                                    \
         libgmp-dev                                                    \
         libssl-dev                                                    \
+        libomp-dev                                                    \
         make                                                          \
         cmake                                                         \
         python3                                                       \
